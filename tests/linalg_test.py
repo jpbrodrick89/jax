@@ -1381,9 +1381,41 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     self._CheckAgainstNumpy(np_fun, jnp_fun_numpy_resid, args_maker, check_dtypes=False, tol=tol)
     self._CompileAndCheck(jnp_fun, args_maker, atol=tol, rtol=tol)
 
-    # Disabled because grad is flaky for low-rank inputs.
-    # TODO:
-    # jtu.check_grads(lambda *args: jnp_fun(*args)[0], args_maker(), order=2, atol=1e-2, rtol=1e-2)
+    # Gradient check: the custom Golub-Pereyra JVP should produce correct
+    # gradients for full-rank overdetermined systems.
+    if (dtype in (np.float64, np.complex128)
+        and lhs_shape[0] >= lhs_shape[1] and min(lhs_shape) > 0
+        and rhs_shape[-1] > 0 and rcond is None):
+      jtu.check_grads(lambda *args: jnp_fun(*args)[0], args_maker(),
+                       order=1, atol=1e-3, rtol=1e-3)
+
+  @jtu.sample_product(
+    [dict(lhs_shape=lhs_shape, rhs_shape=rhs_shape)
+      for lhs_shape, rhs_shape in [
+          ((6, 2), (6,)),       # overdetermined, single RHS
+          ((8, 3), (8, 2)),     # overdetermined, multiple RHS
+          ((4, 4), (4, 1)),     # square
+      ]
+    ],
+    dtype=[np.float64],
+  )
+  def testLstsqGradGolubPereyra(self, lhs_shape, rhs_shape, dtype):
+    """Test the Golub-Pereyra JVP including the B-term (residual gradient)."""
+    rng = jtu.rand_default(self.rng())
+    jnp_fun = partial(jnp.linalg.lstsq, rcond=None)
+
+    def loss_wrt_a(a, b):
+      x, _, _, _ = jnp_fun(a, b)
+      return jnp.sum(x ** 2)
+
+    def loss_wrt_b(a, b):
+      x, _, _, _ = jnp_fun(a, b)
+      return jnp.sum(x ** 2)
+
+    args = [rng(lhs_shape, dtype), rng(rhs_shape, dtype)]
+    # Check gradients w.r.t. both a and b
+    jtu.check_grads(loss_wrt_a, args, order=2, atol=1e-3, rtol=1e-3)
+    jtu.check_grads(loss_wrt_b, args, order=2, atol=1e-3, rtol=1e-3)
 
   @jtu.sample_product(
       shape=[(2, 1), (2, 2), (1, 2)]

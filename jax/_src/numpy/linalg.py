@@ -1371,10 +1371,79 @@ def solve(a: ArrayLike, b: ArrayLike) -> Array:
   return jnp.vectorize(lax_linalg._solve, signature=signature)(a, b)
 
 
+def _lstsq_pinv(u: Array, s_inv: Array, vt: Array, rhs: Array) -> Array:
+  """Apply the pseudoinverse: A^{dagger} @ rhs = V S^{-1} U^H @ rhs."""
+  uTrhs = tensor_contractions.matmul(
+      u.conj().T, rhs, precision=lax.Precision.HIGHEST)
+  return tensor_contractions.matmul(
+      vt.conj().T, s_inv * uTrhs, precision=lax.Precision.HIGHEST)
+
+
+def _lstsq_svd_factors(a: Array, rcond):
+  """Compute SVD and truncated pseudoinverse factors for lstsq."""
+  u, s, vt = svd(a, full_matrices=False)
+  dtype = a.dtype
+  mask = (s > 0) & (s >= jnp.array(rcond, dtype=s.dtype) * s[0])
+  safe_s = jnp.where(mask, s, 1).astype(dtype)
+  s_inv = jnp.where(mask, 1 / safe_s, 0)[..., np.newaxis]
+  return u, s, vt, s_inv
+
+
+@custom_jvp
+def _lstsq_solve(a: Array, b: Array, rcond: Array) -> Array:
+  """Solve least-squares with custom JVP using the Golub-Pereyra (1973) formula.
+
+  The forward pass computes x = A^{dagger} b via SVD. The JVP avoids
+  differentiating through the SVD factorization and instead uses the
+  Golub-Pereyra implicit derivative:
+
+    dx = A^{dagger} (db - dA x) + A^{dagger} A^{dagger H} dA^H r
+
+  where r = b - Ax is the residual. The first term captures the effect of
+  perturbing the RHS and the operator on the solution. The second term
+  (the B term in Golub-Pereyra) captures the effect of the operator
+  perturbation on the residual, and vanishes when A has full column rank
+  and the system is consistent.
+
+  References:
+    Golub, G. H., & Pereyra, V. (1973). The differentiation of pseudo-inverses
+    and nonlinear least squares problems whose variables separate. SIAM Journal
+    on Numerical Analysis, 10(2), 413-432.
+  """
+  u, s, vt, s_inv = _lstsq_svd_factors(a, rcond)
+  return _lstsq_pinv(u, s_inv, vt, b)
+
+
+@_lstsq_solve.defjvp
+def _lstsq_solve_jvp(primals, tangents):
+  a, b, rcond = primals
+  da, db, _ = tangents  # rcond tangent is unused
+
+  # Forward pass: compute x = A^{dagger} b and keep SVD for reuse.
+  u, s, vt, s_inv = _lstsq_svd_factors(a, rcond)
+  x = _lstsq_pinv(u, s_inv, vt, b)
+
+  # JVP: Golub-Pereyra formula.
+  # Term 1: A^{dagger} (db - dA x)
+  rhs = db - tensor_contractions.matmul(da, x, precision=lax.Precision.HIGHEST)
+  dx = _lstsq_pinv(u, s_inv, vt, rhs)
+
+  # Term 2 (B term): A^{dagger} A^{dagger H} dA^H r
+  # Only contributes when the residual r = b - Ax is nonzero.
+  r = b - tensor_contractions.matmul(a, x, precision=lax.Precision.HIGHEST)
+  dAHr = tensor_contractions.matmul(
+      da.conj().T, r, precision=lax.Precision.HIGHEST)
+  # A^{dagger} A^{dagger H} = V diag(1/s_i^2) V^H
+  vt_dAHr = tensor_contractions.matmul(vt, dAHr, precision=lax.Precision.HIGHEST)
+  dx = dx + tensor_contractions.matmul(
+      vt.conj().T, (s_inv ** 2) * vt_dAHr, precision=lax.Precision.HIGHEST)
+
+  return x, dx
+
+
 def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
            numpy_resid: bool = False) -> tuple[Array, Array, Array, Array]:
   # TODO: add lstsq to lax_linalg and implement this function via those wrappers.
-  # TODO: add custom jvp rule for more robust lstsq differentiation
   a, b = promote_dtypes_inexact(a, b)
   if a.shape[0] != b.shape[0]:
     raise ValueError("Leading dimensions of input arrays must match")
@@ -1398,13 +1467,11 @@ def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
       rcond = float(jnp.finfo(dtype).eps) * max(n, m)
     else:
       rcond = jnp.where(rcond < 0, jnp.finfo(dtype).eps, rcond)
-    u, s, vt = svd(a, full_matrices=False)
+    x = _lstsq_solve(a, b, rcond)
+    # Singular values and rank (auxiliary, non-differentiable outputs).
+    u, s, vt = svd(lax.stop_gradient(a), full_matrices=False)
     mask = (s > 0) & (s >= jnp.array(rcond, dtype=s.dtype) * s[0])
     rank = mask.sum()
-    safe_s = jnp.where(mask, s, 1).astype(a.dtype)
-    s_inv = jnp.where(mask, 1 / safe_s, 0)[:, np.newaxis]
-    uTb = tensor_contractions.matmul(u.conj().T, b, precision=lax.Precision.HIGHEST)
-    x = tensor_contractions.matmul(vt.conj().T, s_inv * uTb, precision=lax.Precision.HIGHEST)
   # Numpy returns empty residuals in some cases. To allow compilation, we
   # default to returning full residuals in all cases.
   if numpy_resid and (rank < n or m <= n):
