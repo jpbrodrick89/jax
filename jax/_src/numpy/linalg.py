@@ -1390,8 +1390,11 @@ def _lstsq_svd_factors(a: Array, rcond):
 
 
 @custom_jvp
-def _lstsq_solve(a: Array, b: Array, rcond: Array) -> Array:
+def _lstsq_solve(a: Array, b: Array, rcond: Array) -> tuple[Array, Array]:
   """Solve least-squares with custom JVP using the Golub-Pereyra (1973) formula.
+
+  Returns (x, s) where x is the least-squares solution and s contains the
+  singular values (auxiliary, non-differentiated output).
 
   The forward pass computes x = A^{dagger} b via SVD. The JVP avoids
   differentiating through the SVD factorization and instead uses the
@@ -1411,7 +1414,8 @@ def _lstsq_solve(a: Array, b: Array, rcond: Array) -> Array:
     on Numerical Analysis, 10(2), 413-432.
   """
   u, s, vt, s_inv = _lstsq_svd_factors(a, rcond)
-  return _lstsq_pinv(u, s_inv, vt, b)
+  x = _lstsq_pinv(u, s_inv, vt, b)
+  return x, s
 
 
 @_lstsq_solve.defjvp
@@ -1438,7 +1442,9 @@ def _lstsq_solve_jvp(primals, tangents):
   dx = dx + tensor_contractions.matmul(
       vt.conj().T, (s_inv ** 2) * vt_dAHr, precision=lax.Precision.HIGHEST)
 
-  return x, dx
+  # s is auxiliary: zero tangent.
+  ds = jnp.zeros_like(s)
+  return (x, s), (dx, ds)
 
 
 def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
@@ -1467,9 +1473,9 @@ def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
       rcond = float(jnp.finfo(dtype).eps) * max(n, m)
     else:
       rcond = jnp.where(rcond < 0, jnp.finfo(dtype).eps, rcond)
-    x = _lstsq_solve(a, b, rcond)
-    # Singular values and rank (auxiliary, non-differentiable outputs).
-    u, s, vt = svd(lax.stop_gradient(a), full_matrices=False)
+    x, s = _lstsq_solve(a, b, rcond)
+    # s has zero tangent (auxiliary output from the custom JVP), so rank
+    # computation does not contribute to gradients.
     mask = (s > 0) & (s >= jnp.array(rcond, dtype=s.dtype) * s[0])
     rank = mask.sum()
   # Numpy returns empty residuals in some cases. To allow compilation, we
