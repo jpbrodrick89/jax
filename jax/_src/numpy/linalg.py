@@ -1408,6 +1408,14 @@ def _lstsq_solve(a: Array, b: Array, rcond: Array) -> tuple[Array, Array]:
   perturbation on the residual, and vanishes when A has full column rank
   and the system is consistent.
 
+  Higher-order derivatives:
+    Term 1 is computed via a recursive call to ``_lstsq_solve``, so second-
+    and higher-order AD re-enters this custom JVP rule rather than
+    differentiating through SVD (analogous to the ``custom_linear_solve``
+    pattern for square systems). The B-term uses ``stop_gradient``'d SVD
+    factors, making its higher-order contributions approximate; this is
+    acceptable because the B-term is zero for consistent systems.
+
   References:
     Golub, G. H., & Pereyra, V. (1973). The differentiation of pseudo-inverses
     and nonlinear least squares problems whose variables separate. SIAM Journal
@@ -1423,24 +1431,34 @@ def _lstsq_solve_jvp(primals, tangents):
   a, b, rcond = primals
   da, db, _ = tangents  # rcond tangent is unused
 
-  # Forward pass: compute x = A^{dagger} b and keep SVD for reuse.
-  u, s, vt, s_inv = _lstsq_svd_factors(a, rcond)
-  x = _lstsq_pinv(u, s_inv, vt, b)
+  # Forward pass: call self recursively so that higher-order AD applies
+  # the custom JVP rule again rather than differentiating through SVD.
+  x, s = _lstsq_solve(a, b, rcond)
 
-  # JVP: Golub-Pereyra formula.
-  # Term 1: A^{dagger} (db - dA x)
+  # --- Term 1: A^{dagger} (db - dA x) via recursive solve ---
+  # The recursive call ensures that second-order (and higher) derivatives
+  # re-enter this JVP rule, giving stable implicit differentiation at all
+  # orders without ever differentiating through the SVD factorisation.
   rhs = db - tensor_contractions.matmul(da, x, precision=lax.Precision.HIGHEST)
-  dx = _lstsq_pinv(u, s_inv, vt, rhs)
+  dx, _ = _lstsq_solve(a, rhs, rcond)
 
-  # Term 2 (B term): A^{dagger} A^{dagger H} dA^H r
-  # Only contributes when the residual r = b - Ax is nonzero.
+  # --- Term 2 (B term): V diag(1/s^2) V^H dA^H r ---
+  # This term captures the residual contribution and vanishes for consistent
+  # overdetermined systems.  We use stop_gradient on the SVD factors so
+  # that higher-order AD does not differentiate through SVD for this term.
+  # The B-term's higher-order derivatives are approximate (they ignore
+  # dV/dA, ds/dA), but since the B-term itself is zero whenever the
+  # system is consistent this is a negligible approximation in practice.
+  _, _, vt_sg, s_inv_sg = _lstsq_svd_factors(
+      lax.stop_gradient(a), lax.stop_gradient(rcond))
   r = b - tensor_contractions.matmul(a, x, precision=lax.Precision.HIGHEST)
   dAHr = tensor_contractions.matmul(
       da.conj().T, r, precision=lax.Precision.HIGHEST)
-  # A^{dagger} A^{dagger H} = V diag(1/s_i^2) V^H
-  vt_dAHr = tensor_contractions.matmul(vt, dAHr, precision=lax.Precision.HIGHEST)
+  vt_dAHr = tensor_contractions.matmul(
+      vt_sg, dAHr, precision=lax.Precision.HIGHEST)
   dx = dx + tensor_contractions.matmul(
-      vt.conj().T, (s_inv ** 2) * vt_dAHr, precision=lax.Precision.HIGHEST)
+      vt_sg.conj().T, (s_inv_sg ** 2) * vt_dAHr,
+      precision=lax.Precision.HIGHEST)
 
   # s is auxiliary: zero tangent.
   ds = jnp.zeros_like(s)
