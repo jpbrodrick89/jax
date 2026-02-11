@@ -29,6 +29,8 @@ from jax._src.lax.linalg import (
   householder_product_p as householder_product_p,
   lu as lu,
   lu_p as lu_p,
+  ormqr as ormqr,
+  ormqr_p as ormqr_p,
   lu_pivots_to_permutation as lu_pivots_to_permutation,
   lu_pivots_to_permutation_p as lu_pivots_to_permutation_p,
   qr as qr,

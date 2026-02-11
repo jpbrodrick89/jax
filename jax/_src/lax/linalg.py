@@ -1395,6 +1395,99 @@ register_cpu_gpu_lowering(
     householder_product_p, _householder_product_cpu_gpu_lowering)
 
 
+# Orthogonal QR Multiply (ormqr)
+# Applies Q from QR factorization to a matrix without materializing Q
+
+def ormqr(a: ArrayLike, taus: ArrayLike, c: ArrayLike, *,
+          left: bool = True, transpose: bool = False) -> Array:
+  """Multiplies a matrix by Q from a QR factorization without materializing Q.
+
+  Computes ``Q @ C`` (``left=True``, ``transpose=False``),
+  ``Q^T @ C`` (``left=True``, ``transpose=True``),
+  ``C @ Q`` (``left=False``, ``transpose=False``), or
+  ``C @ Q^T`` (``left=False``, ``transpose=True``).
+
+  For complex types, ``transpose=True`` computes the conjugate transpose
+  (``Q^H``).
+
+  Args:
+    a: The Householder reflectors from :func:`geqrf` or :func:`geqp3`,
+      with shape ``[..., m, n]``.
+    taus: The Householder scalar factors from :func:`geqrf` or :func:`geqp3`,
+      with shape ``[..., k]``.
+    c: The matrix to multiply by Q, with shape ``[..., c_rows, c_cols]``.
+    left: If ``True``, compute ``Q @ C``. If ``False``, compute ``C @ Q``.
+    transpose: If ``True``, use ``Q^T`` (or ``Q^H`` for complex types).
+
+  Returns:
+    The result of multiplying ``c`` by Q (or ``Q^T``/``Q^H``), with the
+    same shape as ``c``.
+  """
+  a, taus, c = core.standard_insert_pvary(a, taus, c)
+  return ormqr_p.bind(a, taus, c, left=left, transpose=transpose)
+
+
+def _ormqr_shape_rule(a_shape, taus_shape, c_shape, *, left, transpose):
+  return c_shape
+
+
+def _ormqr_lowering(a, taus, c, *, left, transpose):
+  # Fallback: materialize Q then multiply
+  *batch_dims, m, n = a.shape
+  # Build the full m×m Q matrix from the Householder reflectors
+  if m < n:
+    q = householder_product(a[..., :m, :m], taus)
+  elif m > n:
+    pads = [(0, 0, 0)] * (len(batch_dims) + 1) + [(0, m - n, 0)]
+    q = lax.pad(a, lax._zero(a), pads)
+    q = householder_product(q, taus)
+  else:
+    q = householder_product(a, taus)
+  if transpose:
+    perm = list(range(q.ndim - 2)) + [q.ndim - 1, q.ndim - 2]
+    q = lax.transpose(q, perm)
+    # For complex types, transpose means conjugate transpose (Q^H).
+    # lax.conj promotes float to complex, so only apply for complex dtypes.
+    if dtypes.issubdtype(q.dtype, np.complexfloating):
+      q = lax.conj(q)
+  if left:
+    return lax.dot_general(q, c,
+                           (((q.ndim - 1,), (c.ndim - 2,)),
+                            (tuple(range(q.ndim - 2)),
+                             tuple(range(c.ndim - 2)))))
+  else:
+    return lax.dot_general(c, q,
+                           (((c.ndim - 1,), (q.ndim - 2,)),
+                            (tuple(range(c.ndim - 2)),
+                             tuple(range(q.ndim - 2)))))
+
+
+def _ormqr_cpu_gpu_lowering(ctx, a, taus, c, *, left, transpose,
+                             target_name_prefix: str):
+  a_aval, _, _ = ctx.avals_in
+  if target_name_prefix == "cpu":
+    dtype = a_aval.dtype
+    prefix = "un" if dtypes.issubdtype(dtype, np.complexfloating) else "or"
+    target_name = lapack.prepare_lapack_call(f"{prefix}mqr_ffi", dtype)
+  else:
+    target_name = f"{target_name_prefix}solver_ormqr_ffi"
+  rule = _linalg_ffi_lowering(target_name, operand_output_aliases={2: 0})
+  return rule(ctx, a, taus, c, left=left, transpose=transpose)
+
+
+ormqr_p = standard_linalg_primitive(
+    (_float | _complex, _float | _complex, _float | _complex), (2, 1, 2),
+    _ormqr_shape_rule, "ormqr")
+mlir.register_lowering(ormqr_p, mlir.lower_fun(
+    _ormqr_lowering, multiple_results=False))
+# Only register the FFI-based lowering if the handlers are available in jaxlib.
+# They may not be if jaxlib was built without the ormqr FFI bindings.
+_ormqr_target = lapack.build_lapack_fn_target("ormqr_ffi", np.float32)
+_ormqr_cpu_targets = {t[0] for t in lapack.registrations().get("cpu", [])}
+if _ormqr_target in _ormqr_cpu_targets:
+  register_cpu_gpu_lowering(ormqr_p, _ormqr_cpu_gpu_lowering)
+
+
 # LU decomposition
 
 # Computes a pivoted LU decomposition such that
