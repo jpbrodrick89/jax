@@ -1409,12 +1409,13 @@ def _lstsq_solve(a: Array, b: Array, rcond: Array) -> tuple[Array, Array]:
   and the system is consistent.
 
   Higher-order derivatives:
-    Term 1 is computed via a recursive call to ``_lstsq_solve``, so second-
-    and higher-order AD re-enters this custom JVP rule rather than
-    differentiating through SVD (analogous to the ``custom_linear_solve``
-    pattern for square systems). The B-term uses ``stop_gradient``'d SVD
-    factors, making its higher-order contributions approximate; this is
-    acceptable because the B-term is zero for consistent systems.
+    Both terms are computed via recursive calls to ``_lstsq_solve``, so
+    second- and higher-order AD re-enters this custom JVP rule rather
+    than differentiating through SVD (analogous to the ``custom_linear_solve``
+    pattern for square systems). The B-term uses the identity
+    ``A^{dagger} A^{dagger H} = A^{dagger} (A^H)^{dagger}`` to decompose
+    into two recursive pseudoinverse applications, giving exact derivatives
+    at all orders.
 
   References:
     Golub, G. H., & Pereyra, V. (1973). The differentiation of pseudo-inverses
@@ -1442,23 +1443,21 @@ def _lstsq_solve_jvp(primals, tangents):
   rhs = db - tensor_contractions.matmul(da, x, precision=lax.Precision.HIGHEST)
   dx, _ = _lstsq_solve(a, rhs, rcond)
 
-  # --- Term 2 (B term): V diag(1/s^2) V^H dA^H r ---
+  # --- Term 2 (B term): A^{dagger} A^{dagger H} dA^H r ---
   # This term captures the residual contribution and vanishes for consistent
-  # overdetermined systems.  We use stop_gradient on the SVD factors so
-  # that higher-order AD does not differentiate through SVD for this term.
-  # The B-term's higher-order derivatives are approximate (they ignore
-  # dV/dA, ds/dA), but since the B-term itself is zero whenever the
-  # system is consistent this is a negligible approximation in practice.
-  _, _, vt_sg, s_inv_sg = _lstsq_svd_factors(
-      lax.stop_gradient(a), lax.stop_gradient(rcond))
+  # overdetermined systems.  We use the identity:
+  #   A^{dagger} A^{dagger H} rhs = A^{dagger} ((A^H)^{dagger} rhs)
+  # to decompose into two recursive pseudoinverse applications, avoiding
+  # any direct use of SVD factors.  This gives exact derivatives at all
+  # orders: higher-order AD re-enters this JVP rule for each application.
   r = b - tensor_contractions.matmul(a, x, precision=lax.Precision.HIGHEST)
   dAHr = tensor_contractions.matmul(
       da.conj().T, r, precision=lax.Precision.HIGHEST)
-  vt_dAHr = tensor_contractions.matmul(
-      vt_sg, dAHr, precision=lax.Precision.HIGHEST)
-  dx = dx + tensor_contractions.matmul(
-      vt_sg.conj().T, (s_inv_sg ** 2) * vt_dAHr,
-      precision=lax.Precision.HIGHEST)
+  # (A^H)^{dagger} dA^H r  — lstsq on the conjugate-transposed operator.
+  pinvAH_dAHr, _ = _lstsq_solve(a.conj().T, dAHr, rcond)
+  # A^{dagger} of the above.
+  dx_bterm, _ = _lstsq_solve(a, pinvAH_dAHr, rcond)
+  dx = dx + dx_bterm
 
   # s is auxiliary: zero tangent.
   ds = jnp.zeros_like(s)
