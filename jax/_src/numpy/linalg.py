@@ -23,10 +23,17 @@ from typing import Literal, NamedTuple, overload
 
 import numpy as np
 
+from jax._src import ad_util
 from jax._src import api
+from jax._src import api_util
 from jax._src import core
 from jax._src import config
+from jax._src import linear_util as lu
 from jax._src.custom_derivatives import custom_jvp
+from jax._src.interpreters import ad
+from jax._src.interpreters import batching
+from jax._src.interpreters import mlir
+from jax._src.interpreters import partial_eval as pe
 from jax._src.lax import lax
 from jax._src.lax import linalg as lax_linalg
 from jax._src.lax import utils as lax_utils
@@ -1389,79 +1396,359 @@ def _lstsq_svd_factors(a: Array, rcond):
   return u, s, vt, s_inv
 
 
-@custom_jvp
-def _lstsq_solve(a: Array, b: Array, rcond: Array) -> tuple[Array, Array]:
-  """Solve least-squares with custom JVP using the Golub-Pereyra (1973) formula.
+# ---------------------------------------------------------------------------
+# lstsq_solve primitive — Golub-Pereyra (1973) implicit differentiation
+#
+# Modelled on custom_linear_solve / linear_solve_p (solves.py) but extended
+# for rectangular systems.  The SVD factorisation is computed once (with
+# lax.stop_gradient) and captured inside the solve / solve_t closures.
+# The JVP and transpose rules call the primitive recursively with the
+# *same* closures, so the factorisation is reused and never differentiated
+# through at any order.
+#
+# Four closure jaxprs (matching linear_solve_p's pattern):
+#   matvec:  consts, x  ->  b      (A @ x — differentiable through A)
+#   vecmat:  consts, b  ->  x      (Aᴴ @ b — differentiable through A)
+#   solve:   consts, b  ->  x      (A†b via pre-computed SVD)
+#   solve_t: consts, x  ->  b      ((Aᴴ)†x via transposed SVD)
+#
+# Primitive arguments (flat):
+#   matvec_consts...  vecmat_consts...  solve_consts...  solve_t_consts...  b  s
+#
+# `s` (singular values) is an auxiliary output that is not differentiated.
+# ---------------------------------------------------------------------------
 
-  Returns (x, s) where x is the least-squares solution and s contains the
-  singular values (auxiliary, non-differentiated output).
+import collections as _collections
+_LstsqTuple = _collections.namedtuple(
+    '_LstsqTuple', 'matvec, vecmat, solve, solve_t')
 
-  The forward pass computes x = A^{dagger} b via SVD. The JVP avoids
-  differentiating through the SVD factorization and instead uses the
-  Golub-Pereyra implicit derivative:
 
-    dx = A^{dagger} (db - dA x) + A^{dagger} A^{dagger H} dA^H r
+def _split_lstsq_args(args, const_lengths):
+  """Split flat primitive args into (params_tuple, b, s)."""
+  params_list = []
+  offset = 0
+  for length in const_lengths:
+    params_list.append(list(args[offset:offset + length]))
+    offset += length
+  b = args[offset]
+  s = args[offset + 1]
+  return _LstsqTuple(*params_list), b, s
 
-  where r = b - Ax is the residual. The first term captures the effect of
-  perturbing the RHS and the operator on the solution. The second term
-  (the B term in Golub-Pereyra) captures the effect of the operator
-  perturbation on the residual, and vanishes when A has full column rank
-  and the system is consistent.
 
-  Higher-order derivatives:
-    Both terms are computed via recursive calls to ``_lstsq_solve``, so
-    second- and higher-order AD re-enters this custom JVP rule rather
-    than differentiating through SVD (analogous to the ``custom_linear_solve``
-    pattern for square systems). The B-term uses the identity
-    ``A^{dagger} A^{dagger H} = A^{dagger} (A^H)^{dagger}`` to decompose
-    into two recursive pseudoinverse applications, giving exact derivatives
-    at all orders.
+def _flatten_lstsq(params):
+  """Flatten an _LstsqTuple of lists into a single list."""
+  return [x for group in params for x in group]
+
+
+def _lstsq_tangent_linear_map(jaxpr, params_dot, *x):
+  """Compute tangent of a linear map: dA @ x (operator tangent only).
+
+  Since matvec and vecmat closures are (conjugate-)linear in their captured
+  constants, the JVP w.r.t. constants is simply f(d_const, x):
+    matvec(da, x)  = da @ x           = JVP_a[a @ x](da)
+    vecmat(da, v)  = conj(da).T @ v   = JVP_a[conj(a).T @ v](da)
+
+  This avoids ``ad.jvp`` which creates a nested JVP trace that does not
+  correctly integrate with outer reverse-mode transposition, causing
+  wrong 2nd-order gradients when the B-term (residual contribution) is
+  active.
+  """
+  params_dot_inst = [ad_util.instantiate(p) for p in params_dot]
+  func = core.jaxpr_as_fun(jaxpr)
+  return func(*(params_dot_inst + list(x)))
+
+
+# --- impl ---
+def _lstsq_solve_impl(*args, const_lengths, jaxprs):
+  params, b, s = _split_lstsq_args(args, const_lengths)
+  (x,) = core.jaxpr_as_fun(jaxprs.solve)(*(params.solve + [b]))
+  return [x, s]
+
+
+# --- abstract eval ---
+def _lstsq_solve_abstract_eval(*args, const_lengths, jaxprs):
+  _, b, s = _split_lstsq_args(args, const_lengths)
+  x_aval = jaxprs.solve.out_avals[0]
+  out_vma = core.standard_vma_rule('lstsq_solve', b, s)
+  return (
+      (x_aval.update(vma=out_vma), s.update(vma=out_vma)),
+      jaxprs.solve.effects,
+  )
+
+
+# --- JVP rule (Golub-Pereyra) ---
+def _lstsq_solve_jvp(primals, tangents, const_lengths, jaxprs):
+  """JVP for lstsq_solve_p.
+
+  Golub-Pereyra (1973) implicit derivative:
+    dx = A†(db - dA x) + A†(Aᴴ)†(dAᴴ r)
+
+  Both terms are computed by recursively binding lstsq_solve_p with
+  the *same* closure jaxprs, so the pre-computed SVD factorisation is
+  reused and never differentiated through.
+
+  The tangent of the operator (dA x) and its adjoint (dAᴴ r) are
+  computed by directly evaluating the matvec/vecmat jaxprs with tangent
+  constants.  This works because those closures are (conjugate-)linear
+  in their constants, so f(d_const, x) = JVP_const[f](const, x)(d_const).
+  Avoiding ad.jvp is critical for correct reverse-mode higher-order
+  differentiation.
 
   References:
-    Golub, G. H., & Pereyra, V. (1973). The differentiation of pseudo-inverses
-    and nonlinear least squares problems whose variables separate. SIAM Journal
-    on Numerical Analysis, 10(2), 413-432.
+    Golub, G. H., & Pereyra, V. (1973). The differentiation of
+    pseudo-inverses and nonlinear least squares problems whose variables
+    separate. SIAM J. Numer. Anal. 10(2), 413-432.
   """
-  u, s, vt, s_inv = _lstsq_svd_factors(a, rcond)
-  x = _lstsq_pinv(u, s_inv, vt, b)
-  return x, s
+  kwargs = dict(const_lengths=const_lengths, jaxprs=jaxprs)
+
+  # --- Primal solve ---
+  x, s = lstsq_solve_p.bind(*primals, **kwargs)
+
+  params, _, _ = _split_lstsq_args(primals, const_lengths)
+  params_dot, b_dot, _ = _split_lstsq_args(tangents, const_lengths)
+
+  has_operator_tangent = not all(
+      type(p) is ad_util.Zero for p in params_dot.matvec)
+
+  # --- dA @ x via tangent of matvec closure ---
+  if has_operator_tangent:
+    (dAx,) = _lstsq_tangent_linear_map(
+        jaxprs.matvec, params_dot.matvec, x)
+
+  # --- Term 1:  A†(db - dA·x)  ---
+  if not has_operator_tangent and type(b_dot) is ad_util.Zero:
+    dx = lax.zeros_like_array(x)
+  else:
+    if not has_operator_tangent:
+      rhs1 = b_dot
+    elif type(b_dot) is ad_util.Zero:
+      rhs1 = lax.neg(dAx)
+    else:
+      rhs1 = lax.sub(b_dot, dAx)
+    flat_args = _flatten_lstsq(params) + [rhs1, s]
+    dx, _ = lstsq_solve_p.bind(*flat_args, **kwargs)
+
+  # --- Term 2 (B-term):  A†·(Aᴴ)†·(dAᴴ r) ---
+  # Only contributes when the operator has a tangent.
+  if has_operator_tangent:
+    # Residual r = b - A x.
+    _, b_primal, _ = _split_lstsq_args(primals, const_lengths)
+    matvec_fn = core.jaxpr_as_fun(jaxprs.matvec)
+    (ax,) = matvec_fn(*(params.matvec + [x]))
+    r = lax.sub(b_primal, ax)
+
+    # dAᴴ r via tangent of vecmat closure.
+    # vecmat computes Aᴴ @ v; its tangent w.r.t. constants gives dAᴴ @ v.
+    (dAH_r,) = _lstsq_tangent_linear_map(
+        jaxprs.vecmat, params_dot.vecmat, r)
+
+    # (Aᴴ)† dAᴴ r — transposed solve.
+    t_const_lengths = _LstsqTuple(
+        const_lengths.vecmat, const_lengths.matvec,
+        const_lengths.solve_t, const_lengths.solve)
+    t_jaxprs = _LstsqTuple(
+        jaxprs.vecmat, jaxprs.matvec,
+        jaxprs.solve_t, jaxprs.solve)
+    t_flat = (params.vecmat + params.matvec
+              + params.solve_t + params.solve + [dAH_r, s])
+    pinvAH_dAHr, _ = lstsq_solve_p.bind(
+        *t_flat, const_lengths=t_const_lengths, jaxprs=t_jaxprs)
+
+    # A† of the above.
+    flat_args2 = _flatten_lstsq(params) + [pinvAH_dAHr, s]
+    dx_bterm, _ = lstsq_solve_p.bind(*flat_args2, **kwargs)
+    dx = lax.add(dx, dx_bterm)
+
+  # s is auxiliary — zero tangent.
+  ds = ad_util.p2tz(s)
+  return [x, s], [dx, ds]
 
 
-@_lstsq_solve.defjvp
-def _lstsq_solve_jvp(primals, tangents):
-  a, b, rcond = primals
-  da, db, _ = tangents  # rcond tangent is unused
+# --- Transpose rule (reverse mode) ---
+def _lstsq_solve_transpose_rule(cotangent, *primals, const_lengths, jaxprs):
+  """Transpose rule: ∂L/∂b = (A†)ᴴ v = (Aᴴ)† v, where v = ∂L/∂x.
 
-  # Forward pass: call self recursively so that higher-order AD applies
-  # the custom JVP rule again rather than differentiating through SVD.
-  x, s = _lstsq_solve(a, b, rcond)
+  For the lstsq primitive, only b is an undefined primal.  The closure
+  parameters (containing the factorisation) are always defined.
 
-  # --- Term 1: A^{dagger} (db - dA x) via recursive solve ---
-  # The recursive call ensures that second-order (and higher) derivatives
-  # re-enter this JVP rule, giving stable implicit differentiation at all
-  # orders without ever differentiating through the SVD factorisation.
-  rhs = db - tensor_contractions.matmul(da, x, precision=lax.Precision.HIGHEST)
-  dx, _ = _lstsq_solve(a, rhs, rcond)
+  Transposing swaps (matvec ↔ vecmat) and (solve ↔ solve_t), which
+  makes the JVP rule work correctly on the transposed problem during
+  higher-order differentiation.
+  """
+  params, b, s_primal = _split_lstsq_args(primals, const_lengths)
+  assert ad.is_undefined_primal(b)
+  assert not ad.is_undefined_primal(s_primal)
+  for group in params:
+    for p in group:
+      assert not ad.is_undefined_primal(p)
 
-  # --- Term 2 (B term): A^{dagger} A^{dagger H} dA^H r ---
-  # This term captures the residual contribution and vanishes for consistent
-  # overdetermined systems.  We use the identity:
-  #   A^{dagger} A^{dagger H} rhs = A^{dagger} ((A^H)^{dagger} rhs)
-  # to decompose into two recursive pseudoinverse applications, avoiding
-  # any direct use of SVD factors.  This gives exact derivatives at all
-  # orders: higher-order AD re-enters this JVP rule for each application.
-  r = b - tensor_contractions.matmul(a, x, precision=lax.Precision.HIGHEST)
-  dAHr = tensor_contractions.matmul(
-      da.conj().T, r, precision=lax.Precision.HIGHEST)
-  # (A^H)^{dagger} dA^H r  — lstsq on the conjugate-transposed operator.
-  pinvAH_dAHr, _ = _lstsq_solve(a.conj().T, dAHr, rcond)
-  # A^{dagger} of the above.
-  dx_bterm, _ = _lstsq_solve(a, pinvAH_dAHr, rcond)
-  dx = dx + dx_bterm
+  x_cotangent, s_cotangent = cotangent
+  if type(x_cotangent) is ad_util.Zero:
+    return [None] * sum(const_lengths) + [ad_util.Zero(b.aval), None]
 
-  # s is auxiliary: zero tangent.
-  ds = jnp.zeros_like(s)
-  return (x, s), (dx, ds)
+  x_cotangent = ad_util.instantiate(x_cotangent)
+
+  # Transpose: swap (matvec, vecmat) and (solve, solve_t).
+  t_const_lengths = _LstsqTuple(
+      const_lengths.vecmat, const_lengths.matvec,
+      const_lengths.solve_t, const_lengths.solve)
+  t_jaxprs = _LstsqTuple(
+      jaxprs.vecmat, jaxprs.matvec,
+      jaxprs.solve_t, jaxprs.solve)
+  t_flat = (params.vecmat + params.matvec
+            + params.solve_t + params.solve + [x_cotangent, s_primal])
+  cotangent_b, _ = lstsq_solve_p.bind(
+      *t_flat, const_lengths=t_const_lengths, jaxprs=t_jaxprs)
+
+  return [None] * sum(const_lengths) + [cotangent_b, None]
+
+
+# --- Batching rule ---
+def _lstsq_solve_batching_rule(axis_data, args, dims, const_lengths, jaxprs):
+  """Batching rule: vmap over b (and possibly closure params)."""
+  params, b, s = _split_lstsq_args(args, const_lengths)
+  params_dims_flat = list(dims[:sum(const_lengths)])
+  b_dim = dims[sum(const_lengths)]
+  s_dim = dims[sum(const_lengths) + 1]
+
+  any_param_batched = any(
+      d is not batching.not_mapped for d in params_dims_flat)
+  b_batched = b_dim is not batching.not_mapped
+  s_batched = s_dim is not batching.not_mapped
+
+  if any_param_batched:
+    raise NotImplementedError(
+        "vmap over lstsq operator parameters is not yet supported")
+
+  if not b_batched and not s_batched:
+    out = lstsq_solve_p.bind(*args, const_lengths=const_lengths, jaxprs=jaxprs)
+    return out, (batching.not_mapped, batching.not_mapped)
+
+  if b_batched and b_dim != 0:
+    b = batching.moveaxis(b, b_dim, 0)
+  if s_batched and s_dim != 0:
+    s = batching.moveaxis(s, s_dim, 0)
+
+  # Batch each jaxpr over the last (rhs) input.
+  batched_jaxpr_list = []
+  for name in _LstsqTuple._fields:
+    jaxpr = getattr(jaxprs, name)
+    n_consts = getattr(const_lengths, name)
+    bat_flags = [False] * n_consts + [b_batched]
+    batched, _ = batching.batch_jaxpr(
+        jaxpr, axis_data, bat_flags, instantiate=[True])
+    batched_jaxpr_list.append(batched)
+  batched_jaxprs = _LstsqTuple(*batched_jaxpr_list)
+
+  flat_args = _flatten_lstsq(params) + [b, s]
+  outs = lstsq_solve_p.bind(
+      *flat_args, const_lengths=const_lengths, jaxprs=batched_jaxprs)
+  return outs, (0, 0 if s_batched else batching.not_mapped)
+
+
+# --- Primitive registration ---
+lstsq_solve_p = core.Primitive('lstsq_solve')
+lstsq_solve_p.multiple_results = True
+lstsq_solve_p.def_impl(_lstsq_solve_impl)
+lstsq_solve_p.def_effectful_abstract_eval(_lstsq_solve_abstract_eval)
+ad.primitive_jvps[lstsq_solve_p] = _lstsq_solve_jvp
+ad.primitive_transposes[lstsq_solve_p] = _lstsq_solve_transpose_rule
+batching.fancy_primitive_batchers[lstsq_solve_p] = _lstsq_solve_batching_rule
+mlir.register_lowering(
+    lstsq_solve_p,
+    mlir.lower_fun(_lstsq_solve_impl, multiple_results=True))
+
+
+def _lstsq_solve(a: Array, b: Array, rcond) -> tuple[Array, Array]:
+  """Solve least-squares via the lstsq_solve primitive.
+
+  Computes x = A†b via SVD.  The SVD factorisation is computed once with
+  ``lax.stop_gradient`` and captured inside closure jaxprs so that the
+  primitive's JVP and transpose rules can reuse it without ever
+  differentiating through the SVD.
+
+  Returns (x, s) where s contains the singular values.
+
+  JVP (Golub-Pereyra 1973):
+    dx = A†(db - dA x) + A†(Aᴴ)†(dAᴴ r)
+  where r = b - Ax is the residual.
+
+  References:
+    Golub, G. H., & Pereyra, V. (1973). The differentiation of
+    pseudo-inverses and nonlinear least squares problems whose variables
+    separate. SIAM J. Numer. Anal. 10(2), 413-432.
+  """
+  from jax._src.tree_util import FlatTree
+
+  # --- Compute SVD once with stop_gradient ---
+  a_sg = lax.stop_gradient(a)
+  rcond_arr = jnp.asarray(rcond)
+  rcond_sg = lax.stop_gradient(rcond_arr)
+  u, s, vt, s_inv = _lstsq_svd_factors(a_sg, rcond_sg)
+
+  # Transposed factors: for Aᴴ = V S Uᴴ, the pseudoinverse is U S⁻¹ Vᴴ.
+  u_t, s_inv_t, vt_t = vt.conj().T, s_inv, u.conj().T
+
+  # --- Trace closures into jaxprs ---
+  b_flat = FlatTree.flatten(b)
+  b_avals = b_flat.map(core.get_aval)
+  b_args_avals = FlatTree.pack(((b_avals,), {}))
+
+  x_shape = (a.shape[1],) + b.shape[1:]
+  x_dummy = array_creation.zeros(x_shape, dtype=b.dtype)
+  x_flat = FlatTree.flatten(x_dummy)
+  x_avals = x_flat.map(core.get_aval)
+  x_args_avals = FlatTree.pack(((x_avals,), {}))
+
+  # matvec: x → A·x  (captures `a` — differentiable)
+  def _matvec_closure(x_):
+    return tensor_contractions.matmul(a, x_, precision=lax.Precision.HIGHEST)
+
+  matvec_debug = api_util.debug_info(
+      "lstsq_matvec", _matvec_closure, (x_dummy,), {})
+  matvec_jaxpr, _ = pe.trace_to_jaxpr(
+      _matvec_closure, x_args_avals, matvec_debug)
+  matvec_jaxpr, matvec_consts = pe.separate_consts(matvec_jaxpr)
+
+  # vecmat: b → Aᴴ·b  (captures `a` — differentiable)
+  def _vecmat_closure(v):
+    return tensor_contractions.matmul(
+        a.conj().T, v, precision=lax.Precision.HIGHEST)
+
+  vecmat_debug = api_util.debug_info(
+      "lstsq_vecmat", _vecmat_closure, (b,), {})
+  vecmat_jaxpr, _ = pe.trace_to_jaxpr(
+      _vecmat_closure, b_args_avals, vecmat_debug)
+  vecmat_jaxpr, vecmat_consts = pe.separate_consts(vecmat_jaxpr)
+
+  # solve: rhs → A†·rhs  (captures SVD factors — stop_gradient'd)
+  def _solve_closure(rhs):
+    return _lstsq_pinv(u, s_inv, vt, rhs)
+
+  solve_debug = api_util.debug_info("lstsq_solve", _solve_closure, (b,), {})
+  solve_jaxpr, _ = pe.trace_to_jaxpr(_solve_closure, b_args_avals, solve_debug)
+  solve_jaxpr, solve_consts = pe.separate_consts(solve_jaxpr)
+
+  # solve_t: rhs → (Aᴴ)†·rhs  (captures transposed SVD — stop_gradient'd)
+  def _solve_t_closure(rhs):
+    return _lstsq_pinv(u_t, s_inv_t, vt_t, rhs)
+
+  solve_t_debug = api_util.debug_info(
+      "lstsq_solve_t", _solve_t_closure, (x_dummy,), {})
+  solve_t_jaxpr, _ = pe.trace_to_jaxpr(
+      _solve_t_closure, x_args_avals, solve_t_debug)
+  solve_t_jaxpr, solve_t_consts = pe.separate_consts(solve_t_jaxpr)
+
+  const_lengths = _LstsqTuple(
+      len(matvec_consts), len(vecmat_consts),
+      len(solve_consts), len(solve_t_consts))
+  jaxprs = _LstsqTuple(matvec_jaxpr, vecmat_jaxpr, solve_jaxpr, solve_t_jaxpr)
+
+  flat_args = (list(matvec_consts) + list(vecmat_consts)
+               + list(solve_consts) + list(solve_t_consts) + [b, s])
+  x, s_out = lstsq_solve_p.bind(
+      *flat_args, const_lengths=const_lengths, jaxprs=jaxprs)
+  return x, s_out
 
 
 def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
