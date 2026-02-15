@@ -1432,34 +1432,58 @@ def _ormqr_shape_rule(a_shape, taus_shape, c_shape, *, left, transpose):
 
 
 def _ormqr_lowering(a, taus, c, *, left, transpose):
-  # Fallback: materialize Q then multiply
+  # Apply Householder reflectors directly to c, matching LAPACK ormqr semantics.
+  # Each H_i = I - tau_i * v_i * v_i^H is applied to c individually,
+  # avoiding O(m^2) materialization of Q. Total cost: O(k * m * c_cols).
   *batch_dims, m, n = a.shape
-  # Build the full m×m Q matrix from the Householder reflectors
-  if m < n:
-    q = householder_product(a[..., :m, :m], taus)
-  elif m > n:
-    pads = [(0, 0, 0)] * (len(batch_dims) + 1) + [(0, m - n, 0)]
-    q = lax.pad(a, lax._zero(a), pads)
-    q = householder_product(q, taus)
-  else:
-    q = householder_product(a, taus)
-  if transpose:
-    perm = list(range(q.ndim - 2)) + [q.ndim - 1, q.ndim - 2]
-    q = lax.transpose(q, perm)
-    # For complex types, transpose means conjugate transpose (Q^H).
-    # lax.conj promotes float to complex, so only apply for complex dtypes.
-    if dtypes.issubdtype(q.dtype, np.complexfloating):
-      q = lax.conj(q)
+  k = taus.shape[-1]  # number of reflectors = min(m, n)
+  is_complex = dtypes.issubdtype(a.dtype, np.complexfloating)
+
+  # Extract Householder vectors: lower triangle with unit diagonal.
+  # V[..., :, i] is the i-th Householder vector.
+  eye = lax._eye(a.dtype, (m, k))
+  if batch_dims:
+    eye = lax.broadcast(eye, tuple(batch_dims))
+  V = _tril(a[..., :, :k], k=-1) + eye
+
+  # Conjugate taus for Q^H (complex types only).
+  effective_taus = lax.conj(taus) if (transpose and is_complex) else taus
+
+  # Application order:
+  #   Q @ c   (left, !trans):  reflectors k→1 (reverse)
+  #   Q^H @ c (left, trans):   reflectors 1→k (forward)
+  #   c @ Q   (!left, !trans): reflectors 1→k (forward)
+  #   c @ Q^H (!left, trans):  reflectors k→1 (reverse)
+  use_reverse = (left != transpose)
+
+  batch_contract = tuple(range(len(batch_dims)))
+
   if left:
-    return lax.dot_general(q, c,
-                           (((q.ndim - 1,), (c.ndim - 2,)),
-                            (tuple(range(q.ndim - 2)),
-                             tuple(range(c.ndim - 2)))))
+    def body(i, c):
+      idx = (k - 1 - i) if use_reverse else i
+      v = V[..., :, idx]               # (..., m)
+      tau = effective_taus[..., idx]    # (...)
+      # c = c - tau * v @ (v^H @ c)
+      v_h = lax.conj(v) if is_complex else v
+      vHc = lax.dot_general(v_h, c,
+          (((v_h.ndim - 1,), (c.ndim - 2,)),
+           (batch_contract, batch_contract)))            # (..., c_cols)
+      update = lax.expand_dims(v, (-1,)) * lax.expand_dims(vHc, (-2,))
+      return c - lax.expand_dims(tau, (-1, -2)) * update
   else:
-    return lax.dot_general(c, q,
-                           (((c.ndim - 1,), (q.ndim - 2,)),
-                            (tuple(range(c.ndim - 2)),
-                             tuple(range(q.ndim - 2)))))
+    def body(i, c):
+      idx = (k - 1 - i) if use_reverse else i
+      v = V[..., :, idx]               # (..., m)
+      tau = effective_taus[..., idx]    # (...)
+      # c = c - tau * (c @ v) @ v^H
+      cv = lax.dot_general(c, v,
+          (((c.ndim - 1,), (v.ndim - 1,)),
+           (batch_contract, batch_contract)))             # (..., c_rows)
+      v_h = lax.conj(v) if is_complex else v
+      update = lax.expand_dims(cv, (-1,)) * lax.expand_dims(v_h, (-2,))
+      return c - lax.expand_dims(tau, (-1, -2)) * update
+
+  return control_flow.fori_loop(0, k, body, c)
 
 
 def _ormqr_cpu_gpu_lowering(ctx, a, taus, c, *, left, transpose,
