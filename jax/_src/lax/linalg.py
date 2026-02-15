@@ -1456,32 +1456,29 @@ def _ormqr_lowering(a, taus, c, *, left, transpose):
   #   c @ Q^H (!left, trans):  reflectors k→1 (reverse)
   use_reverse = (left != transpose)
 
-  batch_contract = tuple(range(len(batch_dims)))
+  n_batch = len(batch_dims)
+  batch_contract = tuple(range(n_batch))
 
-  if left:
-    def body(i, c):
-      idx = (k - 1 - i) if use_reverse else i
-      v = V[..., :, idx]               # (..., m)
-      tau = effective_taus[..., idx]    # (...)
+  def body(i, c):
+    idx = (k - 1 - i) if use_reverse else i
+    tau = effective_taus[..., idx]
+    v = V[..., :, idx]
+    tau_bc = lax.expand_dims(tau, (-1, -2))
+    if left:
       # c = c - tau * v @ (v^H @ c)
       v_h = lax.conj(v) if is_complex else v
       vHc = lax.dot_general(v_h, c,
           (((v_h.ndim - 1,), (c.ndim - 2,)),
-           (batch_contract, batch_contract)))            # (..., c_cols)
+           (batch_contract, batch_contract)))
       update = lax.expand_dims(v, (-1,)) * lax.expand_dims(vHc, (-2,))
-      return c - lax.expand_dims(tau, (-1, -2)) * update
-  else:
-    def body(i, c):
-      idx = (k - 1 - i) if use_reverse else i
-      v = V[..., :, idx]               # (..., m)
-      tau = effective_taus[..., idx]    # (...)
+    else:
       # c = c - tau * (c @ v) @ v^H
       cv = lax.dot_general(c, v,
           (((c.ndim - 1,), (v.ndim - 1,)),
-           (batch_contract, batch_contract)))             # (..., c_rows)
+           (batch_contract, batch_contract)))
       v_h = lax.conj(v) if is_complex else v
       update = lax.expand_dims(cv, (-1,)) * lax.expand_dims(v_h, (-2,))
-      return c - lax.expand_dims(tau, (-1, -2)) * update
+    return c - tau_bc * update
 
   return control_flow.fori_loop(0, k, body, c)
 
