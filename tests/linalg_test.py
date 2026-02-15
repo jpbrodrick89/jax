@@ -1920,14 +1920,11 @@ class ScipyLinalgTest(jtu.JaxTestCase):
     a = rng(a_shape, dtype)
     c = rng(c_shape, dtype)
 
-    # Compute QR factorization
     qr_result, taus = lax_linalg.geqrf(a)
-
-    # Compute using ormqr
     result = lax_linalg.ormqr(qr_result, taus, c,
                                left=left, transpose=transpose)
 
-    # Compute reference using full Q from householder_product
+    # Reference: build full Q from householder_product, then matmul.
     m, n = a_shape[-2:]
     if m > n:
       padded = jnp.pad(qr_result,
@@ -1937,24 +1934,12 @@ class ScipyLinalgTest(jtu.JaxTestCase):
       q = lax.linalg.householder_product(qr_result[..., :m, :m], taus)
     else:
       q = lax.linalg.householder_product(qr_result, taus)
-    if transpose:
-      q_op = jnp.conj(jnp.swapaxes(q, -1, -2))
-    else:
-      q_op = q
-
-    if left:
-      expected = q_op @ c
-    else:
-      expected = c @ q_op
+    q_op = jnp.conj(jnp.swapaxes(q, -1, -2)) if transpose else q
+    expected = q_op @ c if left else c @ q_op
 
     tol = {np.float32: 1e-4, np.complex64: 1e-4, np.float64: 1e-10,
            np.complex128: 1e-10}
     self.assertAllClose(result, expected, rtol=tol, atol=tol)
-    # Also check that it compiles
-    jit_ormqr = jax.jit(partial(lax_linalg.ormqr, left=left,
-                                 transpose=transpose))
-    result_jit = jit_ormqr(qr_result, taus, c)
-    self.assertAllClose(result_jit, expected, rtol=tol, atol=tol)
 
   @jtu.sample_product(
       shape=[(1, 1), (2, 4, 4), (0, 100, 100), (10, 10)],

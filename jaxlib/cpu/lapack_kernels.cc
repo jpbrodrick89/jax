@@ -323,19 +323,13 @@ template struct OrthogonalQr<ffi::DataType::F64>;
 template struct OrthogonalQr<ffi::DataType::C64>;
 template struct OrthogonalQr<ffi::DataType::C128>;
 
-//== Orthogonal QR Multiply                                                ==//
-//== Applies Q from QR factorization to a matrix without materializing Q   ==//
+//== Orthogonal QR Multiply ==//
 
 template <ffi::DataType dtype>
 ffi::Error OrthogonalQrMultiply<dtype>::Kernel(
     ffi::Buffer<dtype> a, ffi::Buffer<dtype> tau, ffi::Buffer<dtype> c,
     bool left, bool transpose,
     ffi::ResultBuffer<dtype> c_out) {
-  // a has shape [..., a_rows, a_cols] (the Householder reflectors from geqrf)
-  // tau has shape [..., k]
-  // c has shape [..., c_rows, c_cols]
-  // c_out has shape [..., c_rows, c_cols]
-
   FFI_ASSIGN_OR_RETURN((auto [batch_count, c_rows, c_cols]),
                        SplitBatch2D(c.dimensions()));
   FFI_ASSIGN_OR_RETURN((auto [a_batch, a_rows, a_cols]),
@@ -361,7 +355,6 @@ ffi::Error OrthogonalQrMultiply<dtype>::Kernel(
                        MaybeCastNoOverflow<lapack_int>(c_cols));
   FFI_ASSIGN_OR_RETURN(auto k_v, MaybeCastNoOverflow<lapack_int>(
                                       tau.dimensions().back()));
-  // lda is the leading dimension of a, which is a_rows (number of rows)
   FFI_ASSIGN_OR_RETURN(auto lda_v, MaybeCastNoOverflow<lapack_int>(a_rows));
 
   int64_t work_size = GetWorkspaceSize(side_v, trans_v, c_rows_v, c_cols_v,

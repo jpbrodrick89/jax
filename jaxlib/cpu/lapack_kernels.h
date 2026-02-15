@@ -199,13 +199,10 @@ struct OrthogonalQr {
 };
 
 //== Orthogonal QR Multiply ==//
-//== Applies Q from QR factorization to a matrix without materializing Q ==//
 
 template <::xla::ffi::DataType dtype>
 struct OrthogonalQrMultiply {
   using ValueType = ::xla::ffi::NativeType<dtype>;
-  // LAPACK signature: dormqr/sormqr/cunmqr/zunmqr
-  // (side, trans, m, n, k, a, lda, tau, c, ldc, work, lwork, info)
   using FnType = void(char* side, char* trans, lapack_int* m, lapack_int* n,
                       lapack_int* k, ValueType* a, lapack_int* lda,
                       ValueType* tau, ValueType* c, lapack_int* ldc,

@@ -1395,8 +1395,7 @@ register_cpu_gpu_lowering(
     householder_product_p, _householder_product_cpu_gpu_lowering)
 
 
-# Orthogonal QR Multiply (ormqr)
-# Applies Q from QR factorization to a matrix without materializing Q
+# Orthogonal QR multiply
 
 def ormqr(a: ArrayLike, taus: ArrayLike, c: ArrayLike, *,
           left: bool = True, transpose: bool = False) -> Array:
@@ -1432,28 +1431,21 @@ def _ormqr_shape_rule(a_shape, taus_shape, c_shape, *, left, transpose):
 
 
 def _ormqr_lowering(a, taus, c, *, left, transpose):
-  # Apply Householder reflectors directly to c, matching LAPACK ormqr semantics.
-  # Each H_i = I - tau_i * v_i * v_i^H is applied to c individually,
-  # avoiding O(m^2) materialization of Q. Total cost: O(k * m * c_cols).
+  # Apply Householder reflectors H_i = I - tau_i * v_i * v_i^H directly to c
+  # without materializing Q. Cost: O(k * m * c_cols).
   *batch_dims, m, n = a.shape
-  k = taus.shape[-1]  # number of reflectors = min(m, n)
+  k = taus.shape[-1]
   is_complex = dtypes.issubdtype(a.dtype, np.complexfloating)
 
-  # Extract Householder vectors: lower triangle with unit diagonal.
-  # V[..., :, i] is the i-th Householder vector.
+  # Householder vectors: lower triangle of a with unit diagonal.
   eye = lax._eye(a.dtype, (m, k))
   if batch_dims:
     eye = lax.broadcast(eye, tuple(batch_dims))
   V = _tril(a[..., :, :k], k=-1) + eye
 
-  # Conjugate taus for Q^H (complex types only).
   effective_taus = lax.conj(taus) if (transpose and is_complex) else taus
 
-  # Application order:
-  #   Q @ c   (left, !trans):  reflectors k→1 (reverse)
-  #   Q^H @ c (left, trans):   reflectors 1→k (forward)
-  #   c @ Q   (!left, !trans): reflectors 1→k (forward)
-  #   c @ Q^H (!left, trans):  reflectors k→1 (reverse)
+  # Q @ c and c @ Q^H apply reflectors in reverse; Q^H @ c and c @ Q forward.
   use_reverse = (left != transpose)
 
   n_batch = len(batch_dims)
@@ -1501,8 +1493,7 @@ ormqr_p = standard_linalg_primitive(
     _ormqr_shape_rule, "ormqr")
 mlir.register_lowering(ormqr_p, mlir.lower_fun(
     _ormqr_lowering, multiple_results=False))
-# Only register the FFI-based lowering if the handlers are available in jaxlib.
-# They may not be if jaxlib was built without the ormqr FFI bindings.
+# Register FFI lowering only if the ormqr bindings are available in jaxlib.
 _ormqr_target = lapack.build_lapack_fn_target("ormqr_ffi", np.float32)
 _ormqr_cpu_targets = {t[0] for t in lapack.registrations().get("cpu", [])}
 if _ormqr_target in _ormqr_cpu_targets:

@@ -1041,17 +1041,13 @@ def qr_multiply(a: ArrayLike, c: ArrayLike, mode: str = 'right',
   else:
     qr_result, taus = lax_linalg.geqrf(a)
 
-  # Apply Q using ormqr (without materializing Q)
   if mode == 'right':
-    # Compute Q @ c (or Q^H @ c if conjugate=True)
     result = lax_linalg.ormqr(qr_result, taus, c,
                                left=True, transpose=conjugate)
   else:
-    # mode == 'left': compute c @ Q^H (or c @ Q if conjugate=True)
     result = lax_linalg.ormqr(qr_result, taus, c,
                                left=False, transpose=(not conjugate))
 
-  # Extract R from qr_result
   r = jnp.triu(qr_result[..., :k, :])
 
   if pivoting:
