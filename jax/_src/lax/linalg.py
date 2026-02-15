@@ -1493,11 +1493,7 @@ ormqr_p = standard_linalg_primitive(
     _ormqr_shape_rule, "ormqr")
 mlir.register_lowering(ormqr_p, mlir.lower_fun(
     _ormqr_lowering, multiple_results=False))
-# Register FFI lowering only if the ormqr bindings are available in jaxlib.
-_ormqr_target = lapack.build_lapack_fn_target("ormqr_ffi", np.float32)
-_ormqr_cpu_targets = {t[0] for t in lapack.registrations().get("cpu", [])}
-if _ormqr_target in _ormqr_cpu_targets:
-  register_cpu_gpu_lowering(ormqr_p, _ormqr_cpu_gpu_lowering)
+register_cpu_gpu_lowering(ormqr_p, _ormqr_cpu_gpu_lowering)
 
 
 # LU decomposition
