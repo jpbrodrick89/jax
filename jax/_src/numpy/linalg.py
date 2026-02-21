@@ -2052,15 +2052,18 @@ def multi_dot(arrays: Sequence[ArrayLike], *, precision: lax.PrecisionLike = Non
   operation order.
 
   Args:
-    arrays: sequence of arrays. All must be two-dimensional, except the first
-      and last which may be one-dimensional.
+    arrays: sequence of arrays. All must be at least two-dimensional, except
+      the first and last which may be one-dimensional. Arrays may include
+      leading batch dimensions, in which case all non-one-dimensional arrays
+      must have the same number of batch dimensions and matching batch shapes.
     precision: either ``None`` (default), which means the default precision for
       the backend, a :class:`~jax.lax.Precision` enum value (``Precision.DEFAULT``,
       ``Precision.HIGH`` or ``Precision.HIGHEST``).
 
   Returns:
     an array representing the equivalent of ``reduce(jnp.matmul, arrays)``, but
-    evaluated in the optimal order.
+    evaluated in the optimal order. If the input arrays include leading batch
+    dimensions, the result will have those batch dimensions as well.
 
   This function exists because the cost of computing sequences of matmul operations
   can differ vastly depending on the order in which the operations are evaluated.
@@ -2117,20 +2120,40 @@ def multi_dot(arrays: Sequence[ArrayLike], *, precision: lax.PrecisionLike = Non
   arrs = list(ensure_arraylike('jnp.linalg.multi_dot', *arrays))
   if len(arrs) < 2:
     raise ValueError(f"multi_dot requires at least two arrays; got len(arrays)={len(arrs)}")
-  if not (arrs[0].ndim in (1, 2) and arrs[-1].ndim in (1, 2) and
-          all(a.ndim == 2 for a in arrs[1:-1])):
-    raise ValueError("multi_dot: input arrays must all be two-dimensional, except for"
-                     " the first and last array which may be 1 or 2 dimensional."
+  if not (arrs[0].ndim >= 1 and arrs[-1].ndim >= 1 and
+          all(a.ndim >= 2 for a in arrs[1:-1])):
+    raise ValueError("multi_dot: input arrays must all be at least two-dimensional, except for"
+                     " the first and last array which may be one-dimensional."
                      f" Got array shapes {[a.shape for a in arrs]}")
-  if any(a.shape[-1] != b.shape[0] for a, b in zip(arrs[:-1], arrs[1:])):
-    raise ValueError("multi_dot: last dimension of each array must match first dimension"
+  # Determine the number of batch dimensions from all non-1D arrays.
+  n_batch_vals = [a.ndim - 2 for a in arrs[1:-1]]
+  if arrs[0].ndim >= 2:
+    n_batch_vals.append(arrs[0].ndim - 2)
+  if arrs[-1].ndim >= 2:
+    n_batch_vals.append(arrs[-1].ndim - 2)
+  n_batch = n_batch_vals[0] if n_batch_vals else 0
+  if not all(n == n_batch for n in n_batch_vals):
+    raise ValueError("multi_dot: arrays have inconsistent number of batch dimensions."
+                     f" Got array shapes {[a.shape for a in arrs]}")
+  if any(a.shape[-1] != (b.shape[0] if b.ndim == 1 else b.shape[-2])
+         for a, b in zip(arrs[:-1], arrs[1:])):
+    raise ValueError("multi_dot: last dimension of each array must match first matrix dimension"
                      f" of following array. Got array shapes {[a.shape for a in arrs]}")
-  einsum_axes: list[tuple[int, ...]] = [(i, i+1) for i in range(len(arrs))]
-  if arrs[0].ndim == 1:
-    einsum_axes[0] = einsum_axes[0][1:]
-  if arrs[-1].ndim == 1:
-    einsum_axes[-1] = einsum_axes[-1][:1]
-  return einsum.einsum(*itertools.chain(*zip(arrs, einsum_axes)),  # type: ignore[call-overload]
+  batch_axes = tuple(range(n_batch))
+  einsum_axes: list[tuple[int, ...]] = []
+  for i, arr in enumerate(arrs):
+    if i == 0 and arr.ndim == 1:
+      einsum_axes.append((n_batch + 1,))
+    elif i == len(arrs) - 1 and arr.ndim == 1:
+      einsum_axes.append((n_batch + len(arrs) - 1,))
+    else:
+      einsum_axes.append(batch_axes + (n_batch + i, n_batch + i + 1))
+  out_axes = batch_axes
+  if arrs[0].ndim >= 2:
+    out_axes = out_axes + (n_batch,)
+  if arrs[-1].ndim >= 2:
+    out_axes = out_axes + (n_batch + len(arrs),)
+  return einsum.einsum(*itertools.chain(*zip(arrs, einsum_axes)), out_axes,  # type: ignore[call-overload]
                        optimize='auto', precision=precision)
 
 

@@ -1360,6 +1360,34 @@ class NumpyLinalgTest(jtu.JaxTestCase):
                           atol=tol, rtol=tol)
 
   @jtu.sample_product(
+    batch_shapes=[
+      [(2, 1, 3), (2, 3, 1)],          # two batched 2D arrays
+      [(4, 1, 3), (4, 3, 5), (4, 5, 2)],  # three batched 2D arrays
+      [(3, ), (4, 3, 5), (4, 5, 2)],   # 1D first, batched rest
+      [(4, 1, 3), (4, 3, 5), (5, )],   # batched first/middle, 1D last
+    ],
+    dtype=float_types + complex_types,
+  )
+  def testMultiDotBatching(self, batch_shapes, dtype):
+    rng = jtu.rand_default(self.rng())
+    arrs = [rng(shape, dtype) for shape in batch_shapes]
+
+    tol = {np.float32: 1e-4, np.float64: 1e-10,
+           np.complex64: 1e-4, np.complex128: 1e-10}
+
+    # Compare direct batched call against vmap of non-batched call.
+    # For 1D arrays (no batch dim), broadcast to match the batch size first.
+    batch_size = next(a.shape[0] for a in arrs if a.ndim > 1)
+    arrs_for_vmap = [
+        jnp.broadcast_to(a, (batch_size,) + a.shape) if a.ndim == 1 else a
+        for a in arrs
+    ]
+    vmap_result = vmap(partial(jnp.linalg.multi_dot,
+                               precision=lax.Precision.HIGHEST))(arrs_for_vmap)
+    direct_result = jnp.linalg.multi_dot(arrs, precision=lax.Precision.HIGHEST)
+    self.assertAllClose(direct_result, vmap_result, atol=tol, rtol=tol)
+
+  @jtu.sample_product(
     [dict(lhs_shape=lhs_shape, rhs_shape=rhs_shape)
       for lhs_shape, rhs_shape in [
           ((1, 1), (1, 1)),
