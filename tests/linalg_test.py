@@ -1360,6 +1360,64 @@ class NumpyLinalgTest(jtu.JaxTestCase):
                           atol=tol, rtol=tol)
 
   @jtu.sample_product(
+    # (shapes, batched_index) where batched_index says which array is vmapped.
+    # shapes are the pre-vmap shapes; the vmapped array gains a leading batch dim.
+    [
+      dict(shapes=[(3, 5), (5, 4), (4,)], batched_index=2),   # last vector
+      dict(shapes=[(4,), (4, 5), (5, 3)], batched_index=0),   # first vector
+      dict(shapes=[(3, 5), (5, 4), (4, 2)], batched_index=1), # middle matrix
+      dict(shapes=[(3, 5), (5, 4), (4,)], batched_index=0),   # first of 3 is matrix, batched
+    ],
+    batch_size=[3, 7],
+    dtype=float_types,
+  )
+  def testMultiDotVmap(self, shapes, batched_index, batch_size, dtype):
+    rng = jtu.rand_default(self.rng())
+    fixed_arrays = [rng(s, dtype) for s in shapes]
+
+    # Build the vmapped function: one argument is batched, rest are closed over.
+    batch_shape = (batch_size,) + shapes[batched_index]
+    batch_array = rng(batch_shape, dtype)
+
+    def fn(x):
+      arrays = list(fixed_arrays)
+      arrays[batched_index] = x
+      return jnp.linalg.multi_dot(arrays)
+
+    result = jax.vmap(fn)(batch_array)
+
+    expected = np.stack([
+        np.linalg.multi_dot(
+            [fixed_arrays[i] if i != batched_index else batch_array[b]
+             for i in range(len(shapes))])
+        for b in range(batch_size)
+    ])
+
+    tol = {np.float32: 1e-4, np.float64: 1e-10}
+    self.assertAllClose(result, expected, atol=tol[dtype], rtol=tol[dtype])
+
+  def testMultiDotVmapOptimization(self):
+    # When vmap is applied to multi_dot([A, B, v]) with a wide batch of v,
+    # the custom vmap rule should let opt_einsum choose (A@B)@v rather than
+    # the naive A@(B@v) order.  For M=10, K=100, N=10, batch=100:
+    #   naive  A@(B@v):  batch*(K*N + M*K)  = 100*(1000+1000) = 200 000 mult-adds
+    #   optimal (A@B)@v: M*K*N + batch*M*N  =  10000 + 10000  =  20 000 mult-adds
+    # JAX cost_analysis counts 2 ops per mult-add, so we expect ≤ 50 000 flops.
+    M, K, N, B = 10, 100, 10, 100
+    A = jnp.ones((M, K))
+    Bm = jnp.ones((K, N))
+    C = jnp.ones((B, N))
+
+    def mmv(v):
+      return jnp.linalg.multi_dot([A, Bm, v])
+
+    flops = jax.jit(jax.vmap(mmv)).lower(C).cost_analysis()['flops']
+    naive_flops = 2 * B * (K * N + M * K)   # 400 000
+    optimal_flops = 2 * (M * K * N + B * M * N)  # 40 000
+    self.assertLess(flops, naive_flops / 4,
+                    msg=f"Expected optimized flops (~{optimal_flops}), got {flops}")
+
+  @jtu.sample_product(
     [dict(lhs_shape=lhs_shape, rhs_shape=rhs_shape)
       for lhs_shape, rhs_shape in [
           ((1, 1), (1, 1)),
