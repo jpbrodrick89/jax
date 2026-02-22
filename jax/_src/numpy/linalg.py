@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from functools import partial
 import itertools
 import math
@@ -27,6 +27,7 @@ from jax._src import api
 from jax._src import core
 from jax._src import config
 from jax._src import custom_batching
+from jax._src import tree_util
 from jax._src.custom_derivatives import custom_jvp
 from jax._src.lax import lax
 from jax._src.lax import linalg as lax_linalg
@@ -43,6 +44,12 @@ from jax._src.typing import ArrayLike, Array, DTypeLike
 
 
 export = set_module('jax.numpy.linalg')
+
+# Register lax.Precision as a static pytree node so that precision values
+# passed to _multi_dot_compute are stored in the treedef aux_data rather than
+# as traced JAX leaves.  This lets custom_vmap handle them without hitting
+# core.get_aval, and lets the vmap rule receive precision via tree_unflatten.
+tree_util.register_static(lax.Precision)
 
 
 class EighResult(NamedTuple):
@@ -2043,65 +2050,60 @@ def tensorsolve(a: ArrayLike, b: ArrayLike, axes: tuple[int, ...] | None = None)
   return solve(a_arr, b_arr.ravel()).reshape(out_shape)
 
 
-def _make_multi_dot_compute(precision: lax.PrecisionLike) -> Callable:
-  """Return a custom_vmap-decorated function with `precision` baked in.
+@custom_batching.custom_vmap
+def _multi_dot_compute(arrays: list[Array], precision: lax.PrecisionLike) -> Array:
+  # lax.Precision is registered as a static pytree node (see module top), so
+  # precision is stored in the treedef aux_data and never reaches core.get_aval.
+  n = len(arrays)
+  einsum_axes: list[tuple[int, ...]] = [(i, i+1) for i in range(n)]
+  if arrays[0].ndim == 1:
+    einsum_axes[0] = einsum_axes[0][1:]
+  if arrays[-1].ndim == 1:
+    einsum_axes[-1] = einsum_axes[-1][:1]
+  return einsum.einsum(*itertools.chain(*zip(arrays, einsum_axes)),  # type: ignore[call-overload]
+                       optimize='auto', precision=precision)
 
-  ``precision`` is captured as a Python closure rather than being passed as a
-  traced JAX argument, which avoids issues with custom_vmap's resolve_kwargs
-  when precision is a non-array Python enum.
-  """
-  @custom_batching.custom_vmap
-  def _compute(arrays: list[Array]) -> Array:
-    n = len(arrays)
-    einsum_axes: list[tuple[int, ...]] = [(i, i+1) for i in range(n)]
-    if arrays[0].ndim == 1:
-      einsum_axes[0] = einsum_axes[0][1:]
-    if arrays[-1].ndim == 1:
-      einsum_axes[-1] = einsum_axes[-1][:1]
-    return einsum.einsum(*itertools.chain(*zip(arrays, einsum_axes)),  # type: ignore[call-overload]
-                         optimize='auto', precision=precision)
 
-  @_compute.def_vmap
-  def _vmap(axis_size, in_batched, arrays):
-    # in_batched[0] is a list of bools, one per array in the list argument.
-    # Batched arrays have their batch dim already moved to axis 0 by vmap.
-    #
-    # Key design: non-batched arrays keep their original shape (no fake batch
-    # dim).  Batch label 0 is assigned only to batched arrays.  Chain labels
-    # i+1 / i+2 connect consecutive arrays just as in the non-vmap path.
-    # This lets opt_einsum see the true sizes and choose the optimal order —
-    # e.g. premultiplying fixed matrices (A@B) when the batch width is large.
-    in_batched_arrays = in_batched[0]
-    n = len(arrays)
-    # orig_ndim recovers the pre-vmap rank (vmap prepends one dim for batched).
-    orig_ndims = [a.ndim - (1 if b else 0)
-                  for a, b in zip(arrays, in_batched_arrays)]
+@_multi_dot_compute.def_vmap
+def _multi_dot_vmap(axis_size, in_batched, arrays, precision):
+  # in_batched[0] is a list of bools, one per array in the list argument.
+  # precision arrives via tree_unflatten from the treedef aux_data (not a leaf).
+  # Batched arrays have their batch dim already moved to axis 0 by vmap.
+  #
+  # Key design: non-batched arrays keep their original shape (no fake batch
+  # dim).  Batch label 0 is assigned only to batched arrays.  Chain labels
+  # i+1 / i+2 connect consecutive arrays just as in the non-vmap path.
+  # This lets opt_einsum see the true sizes and choose the optimal order —
+  # e.g. premultiplying fixed matrices (A@B) when the batch width is large.
+  in_batched_arrays = in_batched[0]
+  n = len(arrays)
+  # orig_ndim recovers the pre-vmap rank (vmap prepends one dim for batched).
+  orig_ndims = [a.ndim - (1 if b else 0)
+                for a, b in zip(arrays, in_batched_arrays)]
 
-    einsum_axes: list[tuple[int, ...]] = []
-    for i, (arr, is_batched, orig_ndim) in enumerate(
-        zip(arrays, in_batched_arrays, orig_ndims)):
-      if i == 0 and orig_ndim == 1:
-        chain: tuple[int, ...] = (2,)       # first vector: col label only
-      elif i == n - 1 and orig_ndim == 1:
-        chain = (n,)                         # last vector: row label only
-      else:
-        chain = (i + 1, i + 2)              # matrix: row then col labels
-      einsum_axes.append(((0,) + chain) if is_batched else chain)
+  einsum_axes: list[tuple[int, ...]] = []
+  for i, (arr, is_batched, orig_ndim) in enumerate(
+      zip(arrays, in_batched_arrays, orig_ndims)):
+    if i == 0 and orig_ndim == 1:
+      chain: tuple[int, ...] = (2,)       # first vector: col label only
+    elif i == n - 1 and orig_ndim == 1:
+      chain = (n,)                         # last vector: row label only
+    else:
+      chain = (i + 1, i + 2)              # matrix: row then col labels
+    einsum_axes.append(((0,) + chain) if is_batched else chain)
 
-    # Output: batch (0) + first-array row (1) if matrix + last-array col (n+1)
-    # if matrix.
-    out_sub: tuple[int, ...] = (0,)
-    if orig_ndims[0] == 2:
-      out_sub = out_sub + (1,)
-    if orig_ndims[-1] == 2:
-      out_sub = out_sub + (n + 1,)
+  # Output: batch (0) + first-array row (1) if matrix + last-array col (n+1)
+  # if matrix.
+  out_sub: tuple[int, ...] = (0,)
+  if orig_ndims[0] == 2:
+    out_sub = out_sub + (1,)
+  if orig_ndims[-1] == 2:
+    out_sub = out_sub + (n + 1,)
 
-    result = einsum.einsum(
-        *itertools.chain(*zip(arrays, einsum_axes)), out_sub,  # type: ignore[call-overload]
-        optimize='auto', precision=precision)
-    return result, True
-
-  return _compute
+  result = einsum.einsum(
+      *itertools.chain(*zip(arrays, einsum_axes)), out_sub,  # type: ignore[call-overload]
+      optimize='auto', precision=precision)
+  return result, True
 
 
 @export
@@ -2187,7 +2189,7 @@ def multi_dot(arrays: Sequence[ArrayLike], *, precision: lax.PrecisionLike = Non
   if any(a.shape[-1] != b.shape[0] for a, b in zip(arrs[:-1], arrs[1:])):
     raise ValueError("multi_dot: last dimension of each array must match first dimension"
                      f" of following array. Got array shapes {[a.shape for a in arrs]}")
-  return _make_multi_dot_compute(precision)(arrs)
+  return _multi_dot_compute(arrs, precision)
 
 
 @export
