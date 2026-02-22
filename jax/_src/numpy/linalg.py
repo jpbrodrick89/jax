@@ -2050,64 +2050,46 @@ def tensorsolve(a: ArrayLike, b: ArrayLike, axes: tuple[int, ...] | None = None)
   return solve(a_arr, b_arr.ravel()).reshape(out_shape)
 
 
-@custom_batching.custom_vmap
-def _multi_dot_compute(arrays: list[Array], precision: lax.PrecisionLike) -> Array:
-  # lax.Precision is registered as a static pytree node (see module top), so
-  # precision is stored in the treedef aux_data and never reaches core.get_aval.
-  n = len(arrays)
-  einsum_axes: list[tuple[int, ...]] = [(i, i+1) for i in range(n)]
-  if arrays[0].ndim == 1:
-    einsum_axes[0] = einsum_axes[0][1:]
-  if arrays[-1].ndim == 1:
-    einsum_axes[-1] = einsum_axes[-1][:1]
-  return einsum.einsum(*itertools.chain(*zip(arrays, einsum_axes)),  # type: ignore[call-overload]
-                       optimize='auto', precision=precision)
+def _multi_dot_einsum(arrays: list[Array], orig_ndims: list[int],
+                      precision: lax.PrecisionLike,
+                      in_batched_arrays: list[bool] | None = None) -> Array:
+  """Shared einsum kernel for multi_dot and its vmap batching rule.
 
-
-@_multi_dot_compute.def_vmap
-def _multi_dot_vmap(axis_size, in_batched, arrays, precision):
-  # in_batched[0] is a list of bools, one per array in the list argument.
-  # precision arrives via tree_unflatten from the treedef aux_data (not a leaf).
-  # Batched arrays have their batch dim already moved to axis 0 by vmap.
-  #
-  # Key design: non-batched arrays keep their original shape (no fake batch
-  # dim).  Batch label 0 is assigned only to batched arrays.  Chain labels
-  # i+1 / i+2 connect consecutive arrays just as in the non-vmap path.
-  # This lets opt_einsum see the true sizes and choose the optimal order —
-  # e.g. premultiplying fixed matrices (A@B) when the batch width is large.
-  in_batched_arrays = in_batched[0]
+  When ``in_batched_arrays`` is None the call is non-batched and chain labels
+  start at 0.  When it is provided (vmap path) batch label 0 is reserved and
+  chain labels start at 1, so opt_einsum sees the true per-array sizes and
+  can choose the optimal contraction order.
+  """
   n = len(arrays)
-  # orig_ndim recovers the pre-vmap rank (vmap prepends one dim for batched).
-  orig_ndims = [a.ndim - (1 if b else 0)
-                for a, b in zip(arrays, in_batched_arrays)]
+  batched = in_batched_arrays is not None
+  label_offset = 1 if batched else 0
 
   einsum_axes: list[tuple[int, ...]] = []
-  for i, (arr, is_batched, orig_ndim) in enumerate(
-      zip(arrays, in_batched_arrays, orig_ndims)):
+  for i, orig_ndim in enumerate(orig_ndims):
     if i == 0 and orig_ndim == 1:
-      chain: tuple[int, ...] = (2,)       # first vector: col label only
+      chain: tuple[int, ...] = (label_offset + 1,)   # first vector: col only
     elif i == n - 1 and orig_ndim == 1:
-      chain = (n,)                         # last vector: row label only
+      chain = (label_offset + n - 1,)                 # last vector: row only
     else:
-      chain = (i + 1, i + 2)              # matrix: row then col labels
-    einsum_axes.append(((0,) + chain) if is_batched else chain)
+      chain = (label_offset + i, label_offset + i + 1)  # matrix
+    if batched and in_batched_arrays[i]:  # type: ignore[index]
+      chain = (0,) + chain
+    einsum_axes.append(chain)
 
-  # Output: batch (0) + first-array row (1) if matrix + last-array col (n+1)
-  # if matrix.
-  out_sub: tuple[int, ...] = (0,)
+  out: tuple[int, ...] = (0,) if batched else ()
   if orig_ndims[0] == 2:
-    out_sub = out_sub + (1,)
+    out = out + (label_offset,)
   if orig_ndims[-1] == 2:
-    out_sub = out_sub + (n + 1,)
+    out = out + (label_offset + n,)
 
-  result = einsum.einsum(
-      *itertools.chain(*zip(arrays, einsum_axes)), out_sub,  # type: ignore[call-overload]
+  return einsum.einsum(
+      *itertools.chain(*zip(arrays, einsum_axes)), out,  # type: ignore[call-overload]
       optimize='auto', precision=precision)
-  return result, True
 
 
-@export
-def multi_dot(arrays: Sequence[ArrayLike], *, precision: lax.PrecisionLike = None) -> Array:
+@custom_batching.custom_vmap
+def multi_dot(arrays: Sequence[ArrayLike],
+              precision: lax.PrecisionLike = None) -> Array:
   """Efficiently compute matrix products between a sequence of arrays.
 
   JAX implementation of :func:`numpy.linalg.multi_dot`.
@@ -2189,7 +2171,20 @@ def multi_dot(arrays: Sequence[ArrayLike], *, precision: lax.PrecisionLike = Non
   if any(a.shape[-1] != b.shape[0] for a, b in zip(arrs[:-1], arrs[1:])):
     raise ValueError("multi_dot: last dimension of each array must match first dimension"
                      f" of following array. Got array shapes {[a.shape for a in arrs]}")
-  return _multi_dot_compute(arrs, precision)
+  return _multi_dot_einsum(arrs, [a.ndim for a in arrs], precision)
+
+
+@multi_dot.def_vmap
+def _multi_dot_vmap(axis_size, in_batched, arrays, precision):
+  # in_batched[0]: per-array batched flags; precision arrives via treedef aux_data.
+  in_batched_arrays = in_batched[0]
+  orig_ndims = [a.ndim - (1 if b else 0)
+                for a, b in zip(arrays, in_batched_arrays)]
+  return _multi_dot_einsum(arrays, orig_ndims, precision, in_batched_arrays), True
+
+
+# Export after def_vmap so the custom_vmap object is fully configured first.
+multi_dot = export(multi_dot)
 
 
 @export
