@@ -154,6 +154,31 @@ def test_structure():
         print(f"  {name:30s} {b:10d} {j:8d} {c:8d} {effective:10d}  {notes}")
 
 
+def test_walker_correctness():
+    """Confirm the edge-pushing walker matches jax.hessian on the battery."""
+    print("\n==== EDGE-PUSHING WALKER CORRECTNESS ====")
+    from jax import config
+    prev = config.jax_enable_x64
+    config.update("jax_enable_x64", True)
+    try:
+        for name, builder, expect_nls in PROBLEMS:
+            if not expect_nls:
+                continue
+            f, x = builder()
+            x64 = jnp.asarray(x, dtype=jnp.float64)
+            try:
+                H_walker = nls_hessian(f, x64, use_walker=True)
+                H_ref    = jax.hessian(f)(x64).reshape(x64.size, x64.size)
+                err = float(jnp.max(jnp.abs(H_walker - H_ref)))
+                rel = err / max(float(jnp.max(jnp.abs(H_ref))), 1e-30)
+                ok  = "ok " if rel < 1e-12 else "BAD"
+                print(f"  [{ok}] {name:30s}  abs={err:.2e}  rel={rel:.2e}")
+            except NotImplementedError as e:
+                print(f"  [---] {name:30s}  walker missing rule: {e}")
+    finally:
+        config.update("jax_enable_x64", prev)
+
+
 def test_linear_skip_correctness():
     """Confirm that for linear residuals, the JTJ-only path matches jax.hessian."""
     print("\n==== LINEAR-RESIDUAL SKIP CORRECTNESS ====")
@@ -197,5 +222,6 @@ if __name__ == "__main__":
     test_handcrafted_smoke()
     test_detection_and_correctness()
     test_detection_and_correctness_fp64()
+    test_walker_correctness()
     test_linear_skip_correctness()
     test_structure()

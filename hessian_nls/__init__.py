@@ -28,12 +28,16 @@ from detect import NLSStructure, detect_nls, detect_from_callable
 from extract import residual_subjaxpr, as_callable
 from split import (jtj_branch, residual_correction_branch, split_hessian,
                    is_linear_residual)
+from walker import edge_push_correction, FORWARD_RULES, BACKWARD_RULES
 
 __all__ = [
+    "BACKWARD_RULES",
+    "FORWARD_RULES",
     "NLSStructure",
     "as_callable",
     "detect_from_callable",
     "detect_nls",
+    "edge_push_correction",
     "is_linear_residual",
     "is_nls",
     "jtj_branch",

@@ -151,30 +151,46 @@ def _time_compile(fn_uncompiled, x):
 
 def benchmark_problem(name: str, builder: Callable, sizes):
     print(f"\n===== {name} =====")
-    print(f"  {'n':>5}  {'jax.hessian':>12}  {'nls_hessian':>12}  {'speedup':>8}  "
+    print(f"  {'n':>5}  {'jax.hessian':>12}  {'split (stock)':>14}  "
+          f"{'split (walker)':>15}  {'sp.stock':>9}  {'sp.walker':>9}  "
           f"{'linear?':>7}")
-    print(f"  {'-'*5}  {'-'*12}  {'-'*12}  {'-'*8}  {'-'*7}")
+    print(f"  {'-'*5}  {'-'*12}  {'-'*14}  {'-'*15}  {'-'*9}  {'-'*9}  {'-'*7}")
     for n in sizes:
         f, x = builder(n)
         info = detect_from_callable(f, x)
         linear = is_linear_residual(info) if info is not None else False
 
         baseline = jax.jit(jax.hessian(f))
-        ours     = jax.jit(lambda x: nls_hessian(f, x))
+        stock    = jax.jit(lambda x: nls_hessian(f, x))
+        # Walker only attempted on non-linear (linear path skips correction).
+        walker   = jax.jit(lambda x: nls_hessian(f, x, use_walker=True))
 
         # Correctness sanity at this size (fp64).
-        H_b = baseline(x);  jax.block_until_ready(H_b)
-        H_o = ours(x);      jax.block_until_ready(H_o)
-        err = float(jnp.max(jnp.abs(H_b.reshape(n, n) - H_o)))
-        if err > 1e-9:
-            print(f"  {n:>5}  CORRECTNESS FAILURE: err={err:.2e}")
+        H_b = baseline(x); jax.block_until_ready(H_b)
+        H_s = stock(x);    jax.block_until_ready(H_s)
+        try:
+            H_w = walker(x); jax.block_until_ready(H_w)
+            walker_ok = bool(jnp.max(jnp.abs(H_b.reshape(n, n) - H_w)) < 1e-9)
+        except Exception:
+            walker_ok = False
+        if float(jnp.max(jnp.abs(H_b.reshape(n, n) - H_s))) > 1e-9:
+            print(f"  {n:>5}  CORRECTNESS FAILURE (split-stock)")
             continue
 
         t_b = _time_fn(baseline, x)
-        t_o = _time_fn(ours, x)
-        sp = t_b / t_o
+        t_s = _time_fn(stock, x)
+        sp_s = t_b / t_s
+        if walker_ok:
+            t_w = _time_fn(walker, x)
+            sp_w = t_b / t_w
+            tw_str = f"{t_w*1e3:9.3f} ms"
+            spw_str = f"{sp_w:7.2f}x"
+        else:
+            tw_str = "       n/a"
+            spw_str = "    n/a"
         lin = "yes" if linear else "no"
-        print(f"  {n:>5}  {t_b*1e3:9.3f} ms  {t_o*1e3:9.3f} ms  {sp:7.2f}x  {lin:>7}")
+        print(f"  {n:>5}  {t_b*1e3:9.3f} ms  {t_s*1e3:11.3f} ms  {tw_str:>15}  "
+              f"{sp_s:7.2f}x  {spw_str:>9}  {lin:>7}")
 
 
 def benchmark_branches(name: str, builder: Callable, n: int):
@@ -188,11 +204,14 @@ def benchmark_branches(name: str, builder: Callable, n: int):
     sub = residual_subjaxpr(info.closed_jaxpr, info.residual_var)
     r_fn = as_callable(sub)
 
+    from walker import edge_push_correction
     fns = {
         "jax.hessian (baseline)": jax.jit(jax.hessian(f)),
         "JTJ branch":             jax.jit(lambda x: jtj_branch(r_fn, x)),
-        "correction branch":      jax.jit(lambda x: residual_correction_branch(r_fn, x)),
-        "nls_hessian (whole)":    jax.jit(lambda x: nls_hessian(f, x)),
+        "correction (stock)":     jax.jit(lambda x: residual_correction_branch(r_fn, x)),
+        "correction (walker)":    jax.jit(lambda x: edge_push_correction(sub, x, r_fn(x))),
+        "nls_hessian stock":      jax.jit(lambda x: nls_hessian(f, x)),
+        "nls_hessian walker":     jax.jit(lambda x: nls_hessian(f, x, use_walker=True)),
     }
     for label, fn in fns.items():
         t = _time_fn(fn, x)
