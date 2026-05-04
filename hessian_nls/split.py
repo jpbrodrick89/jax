@@ -45,15 +45,16 @@ def _flatten_argument(x):
 
 
 def jtj_branch(r_fn: Callable, x):
-    """Compute J(x)^T J(x) by forming J explicitly with `jax.jacrev`.
+    """Compute J(x)^T J(x).
 
-    For a residual r: R^n -> R^m, jacrev costs m backward passes (good
-    for m << n) and jacfwd costs n forward passes (good for n << m).
-    A production implementation would pick whichever is smaller and a
-    pair-trim-aware version would propagate sparse Jacobians directly.
+    Picks `jacfwd` when input dim ≤ output dim (forward mode wins), else
+    `jacrev`.  A pair-trim-aware version would propagate sparse Jacobians
+    directly without materialising J.
     """
-    J = jax.jacrev(r_fn)(x)
-    # J has shape (m, *x.shape).  Flatten the trailing dims.
+    n = int(jnp.asarray(x).size)
+    m = int(jnp.asarray(r_fn(x)).size)
+    jac = jax.jacfwd(r_fn) if n <= m else jax.jacrev(r_fn)
+    J = jac(x)
     J_mat = J.reshape(J.shape[0], -1)
     return J_mat.T @ J_mat
 

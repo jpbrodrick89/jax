@@ -86,8 +86,30 @@ PROBLEMS = [
 ]
 
 
+def test_detection_and_correctness_fp64():
+    """Same battery but in float64.  Should achieve relative error ~1e-15."""
+    print("\n==== DETECTION + CORRECTNESS (fp64) ====")
+    # Re-run with jax_enable_x64 turned on temporarily.
+    from jax import config
+    prev = config.jax_enable_x64
+    config.update("jax_enable_x64", True)
+    try:
+        for name, builder, expect_nls in PROBLEMS:
+            f, x = builder()
+            x64 = jnp.asarray(x, dtype=jnp.float64)
+            detected = is_nls(f, x64)
+            H_ours = nls_hessian(f, x64)
+            H_ref  = jax.hessian(f)(x64).reshape(x64.size, x64.size)
+            err = float(jnp.max(jnp.abs(H_ours - H_ref)))
+            rel = err / max(float(jnp.max(jnp.abs(H_ref))), 1e-30)
+            ok = "ok " if rel < 1e-12 else "BAD"
+            print(f"  [{ok}] {name:30s}  abs={err:.2e}  rel={rel:.2e}")
+    finally:
+        config.update("jax_enable_x64", prev)
+
+
 def test_detection_and_correctness():
-    print("\n==== DETECTION + CORRECTNESS ====")
+    print("\n==== DETECTION + CORRECTNESS (fp32) ====")
     for name, builder, expect_nls in PROBLEMS:
         f, x = builder()
         detected = is_nls(f, x)
@@ -174,5 +196,6 @@ def test_handcrafted_smoke():
 if __name__ == "__main__":
     test_handcrafted_smoke()
     test_detection_and_correctness()
+    test_detection_and_correctness_fp64()
     test_linear_skip_correctness()
     test_structure()
